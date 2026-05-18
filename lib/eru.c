@@ -14,7 +14,7 @@ static Shdr *shdr = NULL;
 Offset getAbsOffset(Elf64_Off addend)
 {
 	Offset offset;
-	offset.phdr_index = OFFSET_ABS;
+	offset.index = OFFTYPE_ABSOLUTE;
 	offset.addend = addend;
 
 	return offset;
@@ -45,9 +45,10 @@ void beginElf(void)
 	elf->ehdr.e_phnum = 0;
 	elf->ehdr.e_shentsize = sizeof(Elf64_Shdr);
 	elf->ehdr.e_shnum = 0;
-	elf->ehdr.e_shstrndx = 0;
+	elf->ehdr.e_shstrndx = -1;
 
-	elf->entry.phdr_index = 0;
+	elf->entry.type = OFFTYPE_ABSOLUTE;
+	elf->entry.index = 0;
 	elf->entry.addend = 0;
 	elf->phdr_list = NULL;
 	elf->shdr_list = NULL;
@@ -101,6 +102,11 @@ void elfSetData(unsigned char data)
 	elf->ehdr.e_ident[EI_DATA] = data;
 }
 
+void elfSetShstrndx(Elf64_Half strndx)
+{
+	elf->ehdr.e_shstrndx = strndx;
+}
+
 void beginPhdr(void)
 {
 	if (phdr != NULL)
@@ -112,6 +118,9 @@ void beginPhdr(void)
 
 Phdr *endPhdr(void)
 {
+	if (phdr == NULL)
+		return NULL;
+
 	size_t new_size = (elf->ehdr.e_phnum + 1) * sizeof(Phdr);
 
 	Phdr *new = realloc(elf->phdr_list, new_size);
@@ -163,10 +172,82 @@ unsigned char *phdrSetData(unsigned char *data, size_t data_size)
 Offset phdrGetOffset(Elf64_Off addend)
 {
 	Offset offset;
-	offset.phdr_index = elf->ehdr.e_phnum;
+	offset.type = OFFTYPE_PHDR;
+	offset.index = elf->ehdr.e_phnum;
 	offset.addend = addend;
 
 	return offset;
+}
+
+Elf64_Half phdrGetIndex(void)
+{
+	return elf->ehdr.e_phnum;
+}
+
+void beginShdr(void)
+{
+	if (shdr != NULL)
+		endShdr();
+
+	shdr = calloc(1, sizeof(Shdr));
+	shdr->offset = shdrGetOffset(0);
+}
+
+Shdr *endShdr(void)
+{
+	if (shdr == NULL)
+		return NULL;
+
+	size_t new_size = (elf->ehdr.e_shnum + 1) * sizeof(Shdr);
+
+	Shdr *new = realloc(elf->shdr_list, new_size);
+	if (new == NULL)
+		return NULL;
+
+	elf->shdr_list = new;
+	Shdr *new_shdr = &new[elf->ehdr.e_shnum];
+	memcpy(new_shdr, shdr, sizeof(Shdr));
+	elf->ehdr.e_shnum += 1;
+
+	free(shdr);
+	shdr = NULL;
+
+	return new_shdr;
+}
+
+Elf64_Half shdrGetIndex(void)
+{
+	return elf->ehdr.e_shnum;
+}
+
+Offset shdrGetOffset(Elf64_Off addend)
+{
+	Offset offset;
+	offset.type = OFFTYPE_SHDR;
+	offset.index = elf->ehdr.e_shnum;
+	offset.addend = addend;
+
+	return offset;
+}
+
+void beginStrtab(void)
+{
+	if (shdr == NULL || shdr->shdr.sh_type != SHT_NULL)
+		return;
+
+	shdr->shdr.sh_type = SHT_STRTAB;
+	shdr->data = malloc(1);
+	shdr->data_size = 1;
+}
+
+void endStrtab(void)
+{
+	if (shdr == NULL || shdr->shdr.sh_type != SHT_STRTAB)
+		return;
+}
+
+Elf64_Off strtabAddString(char *string)
+{
 }
 
 void writeToMemory(Elf *ielf, unsigned char **buffer, size_t *buffer_size)
@@ -180,9 +261,18 @@ void writeToMemory(Elf *ielf, unsigned char **buffer, size_t *buffer_size)
 		iphdr->data_offset = shoff;
 		iphdr->phdr.p_offset = shoff;
 
-		Elf64_Off p_offset = 0;
-		if (iphdr->offset.phdr_index != OFFSET_ABS)
-			p_offset = ielf->phdr_list[iphdr->offset.phdr_index].phdr.p_offset;
+		Elf64_Off p_offset;
+		switch (iphdr->offset.type) {
+			case OFFTYPE_ABSOLUTE:
+				p_offset = 0;
+				break;
+			case OFFTYPE_PHDR:
+				p_offset = ielf->phdr_list[iphdr->offset.index].phdr.p_offset;
+				break;
+			case OFFTYPE_SHDR:
+				// TODO: Figure something out...
+				break;
+		}
 		p_offset += iphdr->offset.addend;
 
 		iphdr->phdr.p_offset = p_offset;
@@ -198,10 +288,41 @@ void writeToMemory(Elf *ielf, unsigned char **buffer, size_t *buffer_size)
 	*buffer_size = shdataoff;
 
 	for (int sh = 0; sh < ielf->ehdr.e_shnum; sh++) {
-		*buffer_size += ielf->shdr_list[sh].data_size;
+		Shdr *ishdr = &ielf->shdr_list[sh];
+		ishdr->data_offset = *buffer_size;
+		ishdr->shdr.sh_offset = *buffer_size;
+
+		Elf64_Off sh_offset;
+		switch (ishdr->offset.type) {
+			case OFFTYPE_ABSOLUTE:
+				sh_offset = 0;
+				break;
+			case OFFTYPE_PHDR:
+				sh_offset = ielf->phdr_list[ishdr->offset.index].phdr.p_offset;
+				break;
+			case OFFTYPE_SHDR:
+				sh_offset = ielf->shdr_list[ishdr->offset.index].shdr.sh_offset;
+				break;
+		}
+		sh_offset += ishdr->offset.addend;
+
+		ishdr->shdr.sh_offset = sh_offset;
+		ishdr->shdr.sh_size = ishdr->size;
+
+		*buffer_size += ishdr->data_size;
 	}
 
-	ielf->ehdr.e_entry = ielf->phdr_list[ielf->entry.phdr_index].phdr.p_offset;
+	switch (ielf->entry.type) {
+		case OFFTYPE_ABSOLUTE:
+			ielf->ehdr.e_entry = 0;
+			break;
+		case OFFTYPE_PHDR:
+			ielf->ehdr.e_entry = ielf->phdr_list[ielf->entry.index].phdr.p_offset;
+			break;
+		case OFFTYPE_SHDR:
+			ielf->ehdr.e_entry = ielf->shdr_list[ielf->entry.index].shdr.sh_offset;
+			break;
+	}
 	ielf->ehdr.e_entry += ielf->entry.addend;
 	ielf->ehdr.e_entry += ielf->base_addr;
 	if (ielf->ehdr.e_phnum > 0)
@@ -221,8 +342,12 @@ void writeToMemory(Elf *ielf, unsigned char **buffer, size_t *buffer_size)
 		memcpy(&out[iphoff], &iphdr->phdr, sizeof(Elf64_Phdr));
 		memcpy(&out[iphdr->data_offset], iphdr->data, iphdr->data_size);
 	}
-
-	//TODO: write Elf64_Shdr
+	for (int sh = 0; sh < ielf->ehdr.e_shnum; sh++) {
+		Shdr *ishdr = &ielf->shdr_list[sh];
+		Elf64_Off ishoff = shoff + sh * sizeof(Elf64_Shdr);
+		memcpy(&out[ishoff], &ishdr->shdr, sizeof(Elf64_Shdr));
+		memcpy(&out[ishdr->data_offset], ishdr->data, ishdr->data_size);
+	}
 }
 
 void writeToFile(Elf *ielf, char *filename)
